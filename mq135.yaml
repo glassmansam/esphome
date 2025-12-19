@@ -1,0 +1,202 @@
+esphome:
+  name: mq135
+  friendly_name: "Air Quality Monitor"
+  on_boot:
+    priority: 600
+    then:
+      - light.turn_on:
+          id: status_led
+          brightness: 30%
+          red: 0%
+          green: 0%
+          blue: 100%
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+# FIX 1: MUST use this for C6-Zero to see logs via USB cable
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  encryption:
+    key: "L++JpPBqg0hlzecjd2jVNZPJpxlwp3iBYPOVR4LLmA0="
+
+ota:
+  - platform: esphome
+    password: "7c744da116b2ccb9bd81de8f648bc10f"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "Mq135 Fallback Hotspot"
+    password: "O5wvUr5aPTek"
+
+captive_portal:
+
+substitutions:
+  MQ_VCC: "5.0"
+  MQ_RL: "1000.0"   # <- set to the resistor actually on the module (often "103" = 10k)
+
+globals:
+  - id: calib_r0
+    type: float
+    restore_value: true
+    initial_value: '1500.0'
+  - id: is_calibrating
+    type: bool
+    initial_value: 'false'
+
+light:
+  - platform: esp32_rmt_led_strip
+    rgb_order: RGB
+    pin: GPIO8
+    num_leds: 1
+    chipset: WS2812
+    name: "Status LED"
+    id: status_led
+
+button:
+  - platform: template
+    name: "Calibrate Fresh Air"
+    icon: "mdi:target"
+    on_press:
+      - script.execute: calibrate_sensor
+
+script:
+  - id: calibrate_sensor
+    then:
+      - globals.set:
+          id: is_calibrating
+          value: 'true'
+      - light.turn_on:
+          id: status_led
+          brightness: 50%
+          red: 100%
+          green: 100%
+          blue: 0% # Orange wait
+      - delay: 5s
+      - lambda: |-
+          float v_out = id(mq135_volts_raw).state;
+          const float VCC = ${MQ_VCC};
+          const float R_L = ${MQ_RL};
+          if (v_out > 0) {
+             //float current_resistance = (5.0 - v_out) / v_out * R_L;
+             //#id(calib_r0) = current_resistance;
+             //#ESP_LOGI("calib", "New Baseline R0 set to: %.2f", current_resistance);
+             const float a = 110.47;
+             const float b = -2.862;
+             const float target_ppm = 450.0;
+             
+             float rs = (VCC - v_out) / v_out * R_L;
+             float ratio = powf(target_ppm / a, 1.0f / b);
+             id(calib_r0) = rs / ratio;
+             
+          }
+      - globals.set:
+          id: is_calibrating
+          value: 'false'
+      - light.turn_on:
+          id: status_led
+          red: 0%
+          green: 100%
+          blue: 0%
+          effect: none
+
+sensor:
+  # RAW VOLTAGE (Hidden)
+  - platform: adc
+    pin: GPIO0
+    id: mq135_volts_raw
+    update_interval: 2s
+    attenuation: 12db
+    filters:
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 1
+      - multiply: 1.5
+    # FIX 2: Removed 'on_value' here to stop it from fighting the Text Sensor
+    # internal: true  <-- Uncomment this if you want to hide the voltage graph
+
+  # CALCULATED PPM
+  - platform: template
+    name: "Air Quality)"
+    id: mq135_ppm
+    unit_of_measurement: "PPM"
+    update_interval: 2s
+    lambda: |-
+      const float VCC = ${MQ_VCC};
+      const float R_L = ${MQ_RL};
+      
+      float v_out = id(mq135_volts_raw).state;
+      if (v_out <= 0.0) return 0.0;
+      
+      //#float R_L = ${MQ_RL}; 
+      float R_s = (VCC - v_out) / v_out * R_L;
+      
+      float R_0 = id(calib_r0);
+      if (R_0 <= 0) R_0 = 1500.0;
+
+      float a = 110.47;
+      float b = -2.862;
+      
+      return a * pow((R_s / R_0), b);
+
+text_sensor:
+  - platform: template
+    name: "Air Quality Status"
+    id: aq_status
+    icon: "mdi:gauge"
+    update_interval: 1s
+    lambda: |-
+      if (id(is_calibrating)) {
+        return {"Calibrating..."};
+      }
+      if (id(mq135_ppm).state <= 0) {
+         return {"Warmup"};
+      }
+
+      float ppm = id(mq135_ppm).state;
+      
+      if (ppm < 600) {
+        return {"Good"};
+      } else if (ppm < 1000) {
+        return {"Moderate"};
+      } else {
+        return {"Bad"};
+      }
+    # This sensor now has total control over the LED
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == "Good";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 0%
+                  green: 100%
+                  blue: 0%
+        - if:
+            condition:
+              lambda: 'return x == "Moderate";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 50%
+                  blue: 0%
+        - if:
+            condition:
+              lambda: 'return x == "Bad";'
+            then:
+              - light.turn_on:
+                  id: status_led
+                  red: 100%
+                  green: 0%
+                  blue: 0%

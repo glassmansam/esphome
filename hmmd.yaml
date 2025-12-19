@@ -1,0 +1,121 @@
+esphome:
+  name: hmmd
+  friendly_name: hmmd-mmWave
+
+esp32:
+  board: esp32-c6-devkitc-1
+  framework:
+    type: esp-idf
+
+# Logger can stay default because GPIO 0/1 do not conflict 
+# with the USB logger on the ESP32-C6.
+logger:
+
+api:
+  encryption:
+    key: "hAq7PeI1S5b7uBQRtrwR5hKPC85QXtazJ8jxIHwmTCY="
+
+ota:
+  - platform: esphome
+    password: "a0dfb22efcea11b2199459c562935d75"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  ap:
+    ssid: "Hmmd Fallback Hotspot"
+    password: "fGVYgqvEEk3V"
+
+captive_portal:
+
+uart:
+  id: mmwave_uart
+  # Reverted to 0 and 1 based on your board validation
+  tx_pin: GPIO1 
+  rx_pin: GPIO0
+  baud_rate: 115200
+  # Increased buffer to handle fast streams from mmWave
+  rx_buffer_size: 512
+
+sensor:
+  - platform: template
+    id: mmwave_distance
+    name: "Target Distance"
+    unit_of_measurement: "cm"
+    icon: "mdi:ruler"
+    accuracy_decimals: 0
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+   # timeout: 5s 
+
+binary_sensor:
+  - platform: template
+    id: mmwave_presence
+    name: "Presence Detected"
+    device_class: occupancy
+    filters:
+      - delayed_off: 5s  # <--- This is perfect. Keep this.
+
+globals:
+  - id: uart_line
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+interval:
+  - interval: 20ms
+    then:
+      - lambda: |-
+          // 1. Check if data is available
+          while (id(mmwave_uart).available()) {
+            uint8_t c;
+            // 2. Read the byte safely into 'c'
+            if (id(mmwave_uart).read_byte(&c)) {
+              
+              // 3. Handle Line Endings
+              if (c == '\n' || c == '\r') {
+                if (!id(uart_line).empty()) {
+                  std::string line = id(uart_line);
+                  
+                  // Debug: Print to logs
+                  ESP_LOGD("mmwave_custom", "Received: %s", line.c_str());
+
+                  // 4. Parse "ON" / "OFF"
+                  if (line.find("ON") != std::string::npos) {
+                     id(mmwave_presence).publish_state(true);
+                  } else if (line.find("OFF") != std::string::npos) {
+                     id(mmwave_presence).publish_state(false);
+                  }
+
+                  // 5. Parse "Range"
+                  if (line.find("Range") != std::string::npos) {
+                    size_t first_digit = line.find_first_of("0123456789");
+                    if (first_digit != std::string::npos) {
+                       std::string num_str = line.substr(first_digit);
+                       int dist = atoi(num_str.c_str());
+                       if(dist > 0 && dist < 1000) { 
+                          id(mmwave_distance).publish_state(dist);
+                       }
+                    }
+                  }
+                  
+                  id(uart_line).clear();
+                }
+              } else {
+                // 6. Buffer accumulation
+                if (id(uart_line).size() < 128) {
+                  // Only add printable characters to avoid garbage
+                  if (isprint(c)) {
+                    id(uart_line).push_back((char)c);
+                  }
+                } else {
+                   // Buffer overflow protection
+                   id(uart_line).clear();
+                }
+              }
+            }
+          }
+          
